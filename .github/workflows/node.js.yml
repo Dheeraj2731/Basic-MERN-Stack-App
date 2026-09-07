@@ -1,31 +1,175 @@
-# This workflow will do a clean installation of node dependencies, cache/restore them, build the source code and run tests across different versions of node
-# For more information see: https://docs.github.com/en/actions/automating-builds-and-tests/building-and-testing-nodejs
-
-name: Node.js CI
+name: Full Deploy (Frontend + Backend)
 
 on:
-  push:
-    branches: [ "master" ]
-  pull_request:
-    branches: [ "master" ]
+  workflow_dispatch:
+  push:
+    branches:
+      - main
 
 jobs:
-  build:
+  deploy-frontend:
+    name: Deploy Frontend to S3
+    runs-on: ubuntu-latest
 
-    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
 
-    strategy:
-      matrix:
-        node-version: [18.x, 20.x, 22.x]
-        # See supported Node.js release schedule at https://nodejs.org/en/about/releases/
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20.x
+          cache: npm
 
-    steps:
-    - uses: actions/checkout@v4
-    - name: Use Node.js ${{ matrix.node-version }}
-      uses: actions/setup-node@v4
-      with:
-        node-version: ${{ matrix.node-version }}
-        cache: 'npm'
-    - run: npm ci
-    - run: npm run build --if-present
-    - run: npm test
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Create .env file from secret
+        run: |
+          echo "${{ secrets.FRONTEND_ENV }}" > packages/frontend/.env
+
+      - name: Build frontend
+        run: npm run build --workspace=packages/frontend
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.SECRET_KEY }}
+          aws-region: eu-central-1
+
+      - name: Deploy to S3
+        run: |
+          aws s3 cp packages/frontend/build/ s3://fin-v2-dev/ \
+            --recursive \
+            --acl public-read
+
+      - name: Upload .env to S3
+        run: |
+          aws s3 cp packages/frontend/.env s3://fin-v2-dev/.env \
+            --acl public-read
+
+      - name: Invalidate CloudFront cache (if configured)
+        run: |
+          if [ ! -z "${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }}" ]; then
+            aws cloudfront create-invalidation \
+              --distribution-id ${{ secrets.CLOUDFRONT_DISTRIBUTION_ID }} \
+              --paths "/*"
+          fi
+        continue-on-error: true
+
+  deploy-backend:
+    name: Deploy Backend to EC2
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup SSH
+        uses: webfactory/ssh-agent@v0.8.0
+        with:
+          ssh-private-key: ${{ secrets.EC2_SSH_KEY }}
+
+      - name: Add EC2 to known hosts
+        run: |
+          ssh-keyscan -H ${{ secrets.EC2_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Deploy to EC2
+        run: |
+          ssh ec2-user@${{ secrets.EC2_HOST }} << 'EOF'
+            set -euo pipefail
+            cd finexpert-aqlix
+            git fetch origin main
+            git checkout main
+            git reset --hard origin/main
+            echo "Deploying commit $(git rev-parse --short HEAD)"
+            npm install
+            npm run build:backend
+            ROUTES_JS="packages/backend/dist/packages/backend/src/routes/fbvertragscheck.routes.js"
+            ENTRY_JS="packages/backend/dist/packages/backend/src/api.js"
+            test -f "$ROUTES_JS"
+            test -f "$ENTRY_JS"
+            grep -q "product-configuration" "$ROUTES_JS"
+            echo "Verified product-configuration route in build artifact"
+            echo "PM2 processes before restart:"
+            pm2 list
+            # Every instance of this API must go. A hand-started process under another name
+            # (my-app-dev2/3/...) keeps port 5001 and answers every request, so restarting only
+            # "my-app-dev" deploys new code that nothing serves — the deploy passes and the old
+            # build stays live.
+            for proc in $(pm2 jlist | node -e '
+              let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+                const list = JSON.parse(s||"[]");
+                console.log(list
+                  .filter(p => /^my-app-dev/.test(p.name || ""))
+                  .map(p => p.name).join(" "));
+              });'); do
+              echo "Removing pm2 process: $proc"
+              pm2 delete "$proc" || true
+            done
+            # Restart from repo root so dotenv finds the root .env; use the freshly built entry.
+            GIT_COMMIT="$(git rev-parse --short HEAD)" pm2 start "$ENTRY_JS" --name my-app-dev --update-env
+            pm2 save
+            # Poll rather than sleep: startServer() awaits connectDB(), which runs every seeder
+            # before app.listen(), so the API is not accepting connections for well over 3s.
+            HEALTH=""
+            for _ in $(seq 1 30); do
+              if HEALTH="$(curl -sf http://127.0.0.1:5001/health)"; then break; fi
+              HEALTH=""
+              sleep 2
+            done
+            if [ -z "$HEALTH" ]; then
+              echo "ERROR: API did not become healthy within 60s"
+              pm2 logs my-app-dev --lines 80 --nostream || true
+              pm2 list
+              exit 1
+            fi
+            echo "Live build: $HEALTH"
+            # The live consultation WebSocket rides on this same process and port — there is
+            # no second service to start. Assert it actually attached rather than assuming it.
+            echo "$HEALTH" | grep -q '"attached":true' || {
+              echo "ERROR: /health reports the WebSocket server did not attach to /ws"
+              pm2 logs my-app-dev --lines 80 --nostream || true
+              exit 1
+            }
+            # Assert the live process is the build we just made — but only once /health actually
+            # reports a commit, so deploying a build that predates that field still succeeds.
+            SHA="$(git rev-parse --short HEAD)"
+            if echo "$HEALTH" | grep -q '"commit":"'; then
+              echo "$HEALTH" | grep -q "\"commit\":\"$SHA\"" || {
+                echo "ERROR: :5001 is answering from a different build than $SHA"
+                pm2 list
+                exit 1
+              }
+              echo "Verified live commit: $SHA"
+            else
+              echo "WARNING: /health reports no build.commit — cannot verify which build is live."
+            fi
+            # /health only proves the module loaded. Drive a real client through the HTTP
+            # upgrade and one protocol round-trip, so a broken upgrade path fails the deploy
+            # instead of surfacing as "live sessions don't connect" hours later.
+            echo "Verifying WebSocket upgrade on ws://127.0.0.1:5001/ws"
+            node -e '
+              const WebSocket = require("ws");
+              const fail = (m) => { console.error("ERROR: " + m); process.exit(1); };
+              const ws = new WebSocket("ws://127.0.0.1:5001/ws");
+              const timer = setTimeout(() => fail("no reply from /ws within 10s"), 10000);
+              ws.on("open", () => ws.send("deploy-probe-invalid-token"));
+              ws.on("message", (raw) => {
+                clearTimeout(timer);
+                let msg;
+                try { msg = JSON.parse(raw.toString()); } catch (e) { return fail("non-JSON reply: " + raw); }
+                // code 18 = faulty_authentification: the handshake ran and rejected the probe.
+                if (msg.code !== 18) return fail("unexpected reply: " + JSON.stringify(msg));
+                console.log("WebSocket upgrade + live protocol verified");
+                ws.terminate();
+                process.exit(0);
+              });
+              ws.on("error", (e) => { clearTimeout(timer); fail("upgrade failed: " + e.message); });
+            ' || {
+              pm2 logs my-app-dev --lines 80 --nostream || true
+              exit 1
+            }
+            echo "Backend deployment completed successfully ($(git rev-parse --short HEAD))"
+          EOF
